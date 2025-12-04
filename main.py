@@ -9,10 +9,10 @@ from elasticsearch import Elasticsearch
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD
 import pandas as pd
-from growthbook import GrowthBook
 import xgboost as xgb
 from scipy.sparse import csr_matrix
 from scipy import stats
+import hashlib
 
 
 class NewsRankingSystem:
@@ -20,7 +20,7 @@ class NewsRankingSystem:
     
     def __init__(self, api_url="http://localhost:3000", es_host="localhost:9200"):
         self.api_url = api_url
-        self.es = Elasticsearch("http://localhost:9200",basic_auth=("elastic", "G7r40vJX")) if es_host else None
+        self.es = Elasticsearch("http://localhost:9200", basic_auth=("elastic", "G7r40vJX")) if es_host else None
         self.logs = []
         self.user_histories = defaultdict(list)
         self.articles = []
@@ -38,24 +38,7 @@ class NewsRankingSystem:
         self.article_id_map = {}
         self.reverse_article_map = {}
         
-        # Initialize GrowthBook for A/B testing
-        self.gb = GrowthBook(
-            attributes={},
-            features={
-                "ranking-algorithm": {
-                    "defaultValue": "baseline",
-                    "rules": [{
-                        "condition": {"userId": {"$exists": True}},
-                        "force": None,
-                        "variations": ["baseline", "ltr", "xgboost", "collaborative"],
-                        "weights": [0.25, 0.25, 0.25, 0.25]
-                    }]
-                }
-            },
-            trackingCallback=self._tracking_callback
-        )
-        
-        # Experiment tracking - focus on weighted clicks metric
+        # Experiment tracking
         self.experiment_data = []
         self.variant_metrics = defaultdict(lambda: {
             'weighted_clicks': [],
@@ -63,15 +46,8 @@ class NewsRankingSystem:
             'queries': 0
         })
         
-    def _tracking_callback(self, experiment, result):
-        """Callback for GrowthBook experiment tracking"""
-        self.experiment_data.append({
-            'experiment_key': experiment.key,
-            'variant': result.value,
-            'user_id': self.gb.attributes.get('userId'),
-            'in_experiment': result.inExperiment,
-            'timestamp': datetime.now().isoformat()
-        })
+        # A/B test phase control
+        self.ab_test_phase = "baseline"  # "baseline" or "experiment"
     
     def load_articles(self, filepath='articles.jsonl'):
         """Load articles from JSONL file (uuid, text, topics)"""
@@ -468,13 +444,17 @@ class NewsRankingSystem:
         return [aid for aid, _ in scored_articles[:top_k]]
     
     def get_variant_for_user(self, user_id):
-        """Use GrowthBook to determine which variant to show"""
-        self.gb.attributes = {
-            'userId': user_id,
-            'id': user_id
-        }
-        variant = self.gb.getFeatureValue("ranking-algorithm", "baseline")
-        return variant
+        """Deterministic hash-based variant assignment"""
+        if self.ab_test_phase == "baseline":
+            return "baseline"
+        
+        # Use MD5 hash for consistent assignment across queries
+        hash_val = int(hashlib.md5(str(user_id).encode()).hexdigest()[:8], 16)
+        
+        # Map to variant (25% each)
+        variant_idx = hash_val % 4
+        variants = ["baseline", "ltr", "xgboost", "collaborative"]
+        return variants[variant_idx]
     
     def get_ranking_by_variant(self, variant, query_text, user_id, top_k=20):
         """Get ranking based on assigned variant"""
@@ -489,7 +469,10 @@ class NewsRankingSystem:
     
     def collect_data_with_ab_testing(self, num_queries=100):
         """Collect interaction data using A/B testing"""
-        print(f"Collecting {num_queries} queries with A/B testing...")
+        print(f"Collecting {num_queries} queries (phase: {self.ab_test_phase})...")
+        
+        # Track variant assignments
+        variant_counts = defaultdict(int)
         
         for i in range(num_queries):
             try:
@@ -501,6 +484,7 @@ class NewsRankingSystem:
                 
                 # Get variant assignment
                 variant = self.get_variant_for_user(user_id)
+                variant_counts[variant] += 1
                 
                 # Get ranked list based on variant
                 ranked_ids, ranking_method = self.get_ranking_by_variant(
@@ -513,8 +497,7 @@ class NewsRankingSystem:
                 
                 # Calculate weighted clicks metric
                 weighted_clicks = self.calculate_weighted_clicks(actions)
-                print(f"result:{result}")
-                print(f"weighted_clicks:{weighted_clicks}")
+                
                 # Track metrics by variant
                 self.variant_metrics[variant]['weighted_clicks'].append(weighted_clicks)
                 self.variant_metrics[variant]['users'].add(user_id)
@@ -547,16 +530,26 @@ class NewsRankingSystem:
                     self.logs.append(log_entry)
                     self.user_histories[user_id].append(log_entry)
                 
-                if (i + 1) % 10 == 0:
+                if (i + 1) % 50 == 0:
                     print(f"Processed {i + 1}/{num_queries} queries")
-                    for var in self.variant_metrics:
-                        print(f"  {var}: {self.variant_metrics[var]['queries']} queries")
+                    print("Variant distribution:")
+                    for v in sorted(variant_counts.keys()):
+                        pct = (variant_counts[v] / (i+1)) * 100
+                        print(f"  {v}: {variant_counts[v]} ({pct:.1f}%)")
                     
             except Exception as e:
                 print(f"Error processing query {i}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
-        print(f"Collected {len(self.logs)} interaction logs")
+        print(f"\nFinal variant distribution:")
+        total = sum(variant_counts.values())
+        for v in sorted(variant_counts.keys()):
+            pct = (variant_counts[v] / total) * 100 if total > 0 else 0
+            print(f"  {v}: {variant_counts[v]} ({pct:.1f}%)")
+        
+        print(f"Collected {len(self.logs)} total interaction logs")
     
     def run_experiment(self, initial_queries=100, experiment_queries=200):
         """Run complete experiment with A/B testing"""
@@ -564,7 +557,7 @@ class NewsRankingSystem:
         
         # Phase 1: Collect initial baseline data
         print("\n--- Phase 1: Initial Data Collection (Baseline Only) ---")
-        self.gb._features["ranking-algorithm"].rules[0].force = "baseline"
+        self.ab_test_phase = "baseline"
         self.collect_data_with_ab_testing(num_queries=initial_queries)
         
         # Phase 2: Train all models
@@ -575,12 +568,15 @@ class NewsRankingSystem:
         
         # Phase 3: Run A/B test
         print("\n--- Phase 3: A/B Testing ---")
-        self.gb._features["ranking-algorithm"].rules[0].force = None
+        self.ab_test_phase = "experiment"
+        
+        # Reset variant metrics for clean experiment
         self.variant_metrics = defaultdict(lambda: {
             'weighted_clicks': [],
             'users': set(),
             'queries': 0
         })
+        
         self.collect_data_with_ab_testing(num_queries=experiment_queries)
         
         # Phase 4: Analyze results
@@ -616,12 +612,14 @@ class NewsRankingSystem:
         # Analyze each variant
         for variant in ['ltr', 'xgboost', 'collaborative']:
             variant_values = self.variant_metrics[variant]['weighted_clicks']
-            print(f"{variant}: {variant_values}")  # DEBUG
-
+            
             if not variant_values:
-                print("s")
+                print(f"\n{'='*70}")
+                print(f"{variant.upper()}")
+                print(f"{'='*70}")
+                print("No data collected for this variant")
                 continue
-            print("as")
+            
             variant_mean = np.mean(variant_values)
             variant_std = np.std(variant_values)
             n_variant = len(variant_values)
@@ -682,24 +680,27 @@ class NewsRankingSystem:
         print("EXPERIMENT SUMMARY")
         print(f"{'='*70}")
         
-        best_variant = max(
-            [(v, r['mean']) for v, r in results.items()],
-            key=lambda x: x[1],
-            default=('baseline', baseline_mean)
-        )
-        
-        print(f"Best performing variant: {best_variant[0].upper()}")
-        print(f"Best mean weighted clicks: {best_variant[1]:.4f}")
-        
-        significant_winners = [v for v, r in results.items() 
-                              if r['significant_95'] and r['improvement'] > 0]
-        
-        if significant_winners:
-            print(f"\n✓ Significant improvements found: {', '.join(significant_winners)}")
-            print("Recommendation: Deploy best performing variant")
+        if results:
+            best_variant = max(
+                [(v, r['mean']) for v, r in results.items()],
+                key=lambda x: x[1],
+                default=('baseline', baseline_mean)
+            )
+            
+            print(f"Best performing variant: {best_variant[0].upper()}")
+            print(f"Best mean weighted clicks: {best_variant[1]:.4f}")
+            
+            significant_winners = [v for v, r in results.items() 
+                                  if r['significant_95'] and r['improvement'] > 0]
+            
+            if significant_winners:
+                print(f"\n✓ Significant improvements found: {', '.join(significant_winners)}")
+                print("Recommendation: Deploy best performing variant")
+            else:
+                print("\n✗ No significant improvements found")
+                print("Recommendation: Continue with baseline or collect more data")
         else:
-            print("\n✗ No significant improvements found")
-            print("Recommendation: Continue with baseline or collect more data")
+            print("No variant data to compare")
         
         return results
     
